@@ -623,7 +623,7 @@ async function initUI() {
         0: new Terminal({
             role: "client",
             parentId: "terminal0",
-            port: window.settings.port || 3000
+            id: 0
         })
     };
     for (let i = 1; i <= 4; i++) {
@@ -657,15 +657,12 @@ async function initUI() {
             return null;
         });
     };
-    if (window.term[0].isReady) {
+    window.term[0].ready.then(() => {
         setTimeout(startShellTabPrewarm, 50);
-    } else {
-        const previousMainTermReady = window.term[0].onready;
-        window.term[0].onready = () => {
-            if (typeof previousMainTermReady === "function") previousMainTermReady();
-            setTimeout(startShellTabPrewarm, 50);
-        };
-    }
+    }).catch(error => {
+        window.term[0].dispose();
+        console.error("Could not attach the main terminal:", error);
+    });
     // Prevent losing hardware keyboard focus on the terminal when using touch keyboard
     window.onmouseup = e => {
         if (window.keyboard.linkedToTerm) window.term[window.currentTerm].term.focus();
@@ -1310,13 +1307,6 @@ window.spawnShellTab = (number, options = {}) => {
     const { activate = false, prewarm = false, sourceCwd = null } = options;
     const terminalEl = document.getElementById(`terminal${number}`);
 
-    if (window.term[number] && typeof window.term[number] === "object") {
-        if (activate) {
-            window.setActiveShellTabUI(number);
-            window.finishShellTabActivation(number);
-        }
-        return Promise.resolve(window.term[number]);
-    }
     if (window.termLoading[number]) {
         if (prewarm && terminalEl) {
             terminalEl.classList.add("prewarm");
@@ -1326,6 +1316,13 @@ window.spawnShellTab = (number, options = {}) => {
             window.pendingTermActivation[number] = true;
         }
         return window.termLoading[number];
+    }
+    if (window.term[number] && typeof window.term[number] === "object") {
+        if (activate) {
+            window.setActiveShellTabUI(number);
+            window.finishShellTabActivation(number);
+        }
+        return Promise.resolve(window.term[number]);
     }
 
     if (prewarm && terminalEl) {
@@ -1338,69 +1335,41 @@ window.spawnShellTab = (number, options = {}) => {
 
     window.setShellTabLabel(number);
 
-    const requestId = `shelltab-${number}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const replyChannel = `ttyspawn-reply-${requestId}`;
     const requestedCwd = sourceCwd || (window.term[0] ? (window.term[0].cwd || window.settings.cwd) : window.settings.cwd);
-
-    window.termLoading[number] = new Promise((resolve, reject) => {
-        ipc.once(replyChannel, (_event, reply) => {
-            if (reply.startsWith("ERROR")) {
-                if (terminalEl) terminalEl.classList.remove("prewarm");
-                window.setShellTabLabel(number);
-                delete window.pendingTermActivation[number];
-                reject(new Error(reply));
-                return;
-            }
-
-            const port = Number(reply.substr(9));
-            const client = new Terminal({
-                role: "client",
-                parentId: `terminal${number}`,
-                port
-            });
-
-            window.term[number] = client;
-
-            client.onclose = () => {
-                delete client.onprocesschange;
-                delete client.onready;
-                window.setShellTabLabel(number);
-                if (terminalEl) {
-                    terminalEl.className = "";
-                    terminalEl.innerHTML = "";
-                }
-                if (typeof client.disableHardwareAcceleration === "function") {
-                    client.disableHardwareAcceleration();
-                }
-                client.term.dispose();
-                window.term[number] = false;
-                delete window.pendingTermActivation[number];
-                if (window.currentTerm === number) {
-                    window.useAppShortcut("PREVIOUS_TAB");
-                }
-            };
-
-            client.onprocesschange = () => {
-                window.setShellTabLabel(number);
-            };
-
-            client.onready = () => {
-                if (terminalEl) terminalEl.classList.remove("prewarm");
-                if (window.pendingTermActivation[number] || window.currentTerm === number) {
-                    delete window.pendingTermActivation[number];
-                    window.setActiveShellTabUI(number);
-                    window.finishShellTabActivation(number);
-                }
-                resolve(client);
-            };
-
+    window.termLoading[number] = ipc.invoke("ttyspawn", number, requestedCwd).then(async id => {
+        const client = new Terminal({role: "client", parentId: `terminal${number}`, id});
+        window.term[number] = client;
+        client.onclose = () => {
             window.setShellTabLabel(number);
-        });
+            if (terminalEl) {
+                terminalEl.className = "";
+                terminalEl.innerHTML = "";
+            }
+            window.term[number] = false;
+            delete window.pendingTermActivation[number];
+            if (window.currentTerm === number) window.useAppShortcut("PREVIOUS_TAB");
+        };
+        client.onprocesschange = () => window.setShellTabLabel(number);
 
-        ipc.send("ttyspawn", {
-            cwd: requestedCwd,
-            requestId
-        });
+        try {
+            await client.ready;
+        } catch (error) {
+            client.dispose();
+            if (window.term[number] === client) client.onclose();
+            throw error;
+        }
+        if (terminalEl) terminalEl.classList.remove("prewarm");
+        if (window.pendingTermActivation[number] || window.currentTerm === number) {
+            delete window.pendingTermActivation[number];
+            window.setActiveShellTabUI(number);
+            window.finishShellTabActivation(number);
+        }
+        return client;
+    }).catch(error => {
+        if (terminalEl) terminalEl.classList.remove("prewarm");
+        window.setShellTabLabel(number);
+        delete window.pendingTermActivation[number];
+        throw error;
     }).finally(() => {
         delete window.termLoading[number];
     });
@@ -1608,11 +1577,6 @@ window.openSettings = async () => {
                         <td><input type="number" id="settingsEditor-audioVolume" value="${window.settings.audioVolume || '1.0'}"></td>
                     </tr>
                     <tr>
-                        <td>port</td>
-                        <td>Local port to use for UI-shell connection</td>
-                        <td><input type="number" id="settingsEditor-port" value="${window.settings.port}"></td>
-                    </tr>
-                    <tr>
                         <td>pingAddr</td>
                         <td>IPv4 address to test Internet connectivity</td>
                         <td><input type="text" id="settingsEditor-pingAddr" value="${window.settings.pingAddr || "1.1.1.1"}"></td>
@@ -1770,7 +1734,6 @@ window.writeSettingsFile = () => {
         audioVolume: Number(document.getElementById("settingsEditor-audioVolume").value),
         pingAddr: document.getElementById("settingsEditor-pingAddr").value,
         clockHours: Number(document.getElementById("settingsEditor-clockHours").value),
-        port: Number(document.getElementById("settingsEditor-port").value),
         monitor: Number(document.getElementById("settingsEditor-monitor").value),
         nointro: (document.getElementById("settingsEditor-nointro").value === "true"),
         nocursor: (document.getElementById("settingsEditor-nocursor").value === "true"),
