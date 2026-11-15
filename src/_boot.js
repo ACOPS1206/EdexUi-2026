@@ -1,19 +1,13 @@
 const signale = require("signale");
-const {app, BrowserWindow, dialog, shell} = require("electron");
+const {app, BrowserWindow, dialog} = require("electron");
+
+let win, tty;
+const extraTtys = new Map();
 
 process.on("uncaughtException", e => {
     signale.fatal(e);
     dialog.showErrorBox("EdexUi-2026 crashed", e.message || "Cannot retrieve error message.");
-    if (tty) {
-        tty.close();
-    }
-    if (extraTtys) {
-        Object.keys(extraTtys).forEach(key => {
-            if (extraTtys[key] !== null) {
-                extraTtys[key].close();
-            }
-        });
-    }
+    closeTerminals();
     process.exit(1);
 });
 
@@ -34,11 +28,10 @@ const remoteMain = require("@electron/remote/main");
 remoteMain.initialize();
 const ipc = electron.ipcMain;
 const path = require("path");
-const url = require("url");
+const {pathToFileURL} = require("url");
 const fs = require("fs");
 const os = require("os");
 const cp = require("child_process");
-const net = require("net");
 const which = require("which");
 const Terminal = require("./classes/terminal.class.js").Terminal;
 
@@ -46,7 +39,19 @@ ipc.on("log", (e, type, content) => {
     signale[type](content);
 });
 
-var win, tty, extraTtys;
+let nextTerminalId = 1;
+const mainWindowURL = pathToFileURL(path.join(__dirname, "ui.html")).href;
+
+function isTrustedTerminalSender({sender, senderFrame}) {
+    return Boolean(win && !win.isDestroyed()
+        && sender === win.webContents && senderFrame
+        && senderFrame === sender.mainFrame && senderFrame.url === mainWindowURL);
+}
+
+function closeTerminals() {
+    tty?.close();
+    for (const term of extraTtys.values()) term.close();
+}
 let frontendReadyShown = false;
 let frontendShowFallbackTimer = null;
 function clearFrontendShowFallback() {
@@ -146,31 +151,6 @@ function parseShellArgs(rawArgs) {
     return matches.map(arg => arg.replace(/^['"]|['"]$/g, ""));
 }
 
-function isPortAvailable(port) {
-    return new Promise(resolve => {
-        const server = net.createServer();
-        server.once("error", () => resolve(false));
-        server.once("listening", () => {
-            server.close(() => resolve(true));
-        });
-        server.listen(port, "127.0.0.1");
-    });
-}
-
-async function findAvailablePort(startPort) {
-    let candidate = Number(startPort) || 3000;
-    for (let i = 0; i < 50; i++) {
-        if (await isPortAvailable(candidate)) return candidate;
-        candidate++;
-    }
-    throw new Error("Could not find a free local port for the terminal backend.");
-}
-
-// Unset proxy env variables to avoid connection problems on the internal websockets
-// See #222
-if (process.env.http_proxy) delete process.env.http_proxy;
-if (process.env.https_proxy) delete process.env.https_proxy;
-
 function loadEarlySettings() {
     try {
         return JSON.parse(fs.readFileSync(settingsFile, "utf8"));
@@ -228,7 +208,6 @@ if (!fs.existsSync(settingsFile)) {
         audioVolume: 1.0,
         clockHours: 24,
         pingAddr: "1.1.1.1",
-        port: 3000,
         nointro: false,
         nocursor: false,
         forceFullscreen: false,
@@ -503,7 +482,6 @@ function createWindow(settings) {
         backgroundColor: '#000000',
         webPreferences: {
             devTools: true,
-	    enableRemoteModule: true,
             contextIsolation: false,
             backgroundThrottling: false,
             webSecurity: true,
@@ -514,15 +492,29 @@ function createWindow(settings) {
         }
     });
     win.setBackgroundColor("#000000");
-    win.loadURL(url.format({
-        pathname: path.join(__dirname, 'ui.html'),
-        protocol: 'file:',
-        slashes: true
-    }));
+    // Harden the renderer: this window only ever displays the bundled ui.html.
+    // Anything that would navigate it away or spawn a secondary window is
+    // blocked, so a malicious file or link cannot take over the app shell.
+    win.webContents.setWindowOpenHandler(({url: target}) => {
+        signale.warn(`Blocked attempt to open a new window: ${target}`);
+        return {action: "deny"};
+    });
+    win.webContents.on("will-navigate", (event, target) => {
+        const current = win.webContents.getURL();
+        if (target !== current) {
+            signale.warn(`Blocked navigation to ${target}`);
+            event.preventDefault();
+        }
+    });
+    win.webContents.on("will-attach-webview", event => {
+        event.preventDefault();
+    });
+
     win.webContents.once("did-finish-load", () => {
         scheduleFrontendShowFallback(1500, "did-finish-load");
     });
     remoteMain.enable(win.webContents);
+    win.loadURL(mainWindowURL);
 
     signale.complete("Frontend window created!");
     if (!allowWindowed) {
@@ -591,26 +583,20 @@ app.on('ready', async () => {
         TERM_PROGRAM_VERSION: app.getVersion()
     }, settingsEnv);
 
-    const requestedPort = Number(settings.port) || 3000;
-    const resolvedPort = await findAvailablePort(requestedPort);
-    if (resolvedPort !== requestedPort) {
-        signale.warn(`Port ${requestedPort} is busy, using ${resolvedPort} instead`);
-        settings.port = resolvedPort;
-        fs.writeFileSync(settingsFile, JSON.stringify(settings, "", 4));
-    }
-
-    signale.pending(`Creating new terminal process on port ${settings.port || '3000'}`);
+    signale.pending("Creating main terminal process");
     tty = new Terminal({
         role: "server",
+        id: 0,
+        isTrustedSender: isTrustedTerminalSender,
         shell: settings.shell,
         params: parseShellArgs(settings.shellArgs),
         cwd: resolvedStartDir,
-        env: cleanEnv,
-        port: settings.port || 3000
+        env: cleanEnv
     });
     signale.success(`Terminal back-end initialized!`);
     tty.onclosed = (code, signal) => {
-        tty.ondisconnected = () => {};
+        // Typing "exit" (or closing the shell) in the main terminal ends the
+        // session, so shut the whole application down.
         signale.complete("Terminal exited", code, signal);
         app.quit();
     };
@@ -621,11 +607,6 @@ app.on('ready', async () => {
     tty.onresized = (cols, rows) => {
         signale.info("Resized TTY to ", cols, rows);
     };
-    tty.ondisconnected = () => {
-        signale.error("Lost connection to frontend");
-        signale.watch("Waiting for frontend connection...");
-    };
-
     // Support for multithreaded systeminformation calls
     signale.pending("Starting multithreaded calls controller...");
     require("./_multithread.js");
@@ -635,66 +616,39 @@ app.on('ready', async () => {
         signale.warn("Installed apps preload failed", error && (error.message || String(error)));
     });
 
-    // Support for more terminals, used for creating tabs (currently limited to 4 extra terms)
-    extraTtys = {};
-    let basePort = settings.port || 3000;
-    basePort = Number(basePort) + 2;
+    ipc.handle("terminal:attach", (event, id) => {
+        if (!isTrustedTerminalSender(event)) throw new Error("Untrusted terminal sender");
+        const term = id === 0 ? tty : [...extraTtys.values()].find(term => term.id === id);
+        if (!term || !term.attach(event.sender)) throw new Error("Terminal has closed");
+    });
 
-    for (let i = 0; i < 4; i++) {
-        extraTtys[basePort+i] = null;
-    }
+    ipc.handle("ttyspawn", (event, tab, cwd) => {
+        if (!isTrustedTerminalSender(event)) throw new Error("Untrusted terminal sender");
+        if (!Number.isInteger(tab) || tab < 1 || tab > 4) throw new Error("Invalid terminal tab");
 
-    ipc.on("ttyspawn", (e, arg) => {
-        const requestedCwd = (arg && typeof arg === "object" && typeof arg.cwd === "string" && arg.cwd.trim()) ? arg.cwd.trim() : null;
-        const requestId = (arg && typeof arg === "object" && typeof arg.requestId === "string" && arg.requestId.trim()) ? arg.requestId.trim() : null;
-        const replyChannel = requestId ? `ttyspawn-reply-${requestId}` : "ttyspawn-reply";
-        const reply = message => {
-            e.sender.send(replyChannel, message);
-        };
-        let port = null;
-        Object.keys(extraTtys).forEach(key => {
-            if (extraTtys[key] === null && port === null) {
-                extraTtys[key] = {};
-                port = key;
-            }
+        const existing = extraTtys.get(tab);
+        if (existing) return existing.id;
+
+        const id = nextTerminalId++;
+        const requestedCwd = typeof cwd === "string" && cwd.trim() ? cwd.trim() : null;
+        const term = new Terminal({
+            role: "server",
+            id,
+            isTrustedSender: isTrustedTerminalSender,
+            shell: settings.shell,
+            params: parseShellArgs(settings.shellArgs),
+            cwd: requestedCwd || tty.tty._cwd || resolvedStartDir,
+            env: cleanEnv
         });
-
-        if (port === null) {
-            signale.error("TTY spawn denied (Reason: exceeded max TTYs number)");
-            reply("ERROR: max number of ttys reached");
-        } else {
-            signale.pending(`Creating new TTY process on port ${port}`);
-            let term = new Terminal({
-                role: "server",
-                shell: settings.shell,
-                params: parseShellArgs(settings.shellArgs),
-                cwd: requestedCwd || tty.tty._cwd || resolvedStartDir,
-                env: cleanEnv,
-                port: port
-            });
-            signale.success(`New terminal back-end initialized at ${port}`);
-            term.onclosed = (code, signal) => {
-                term.ondisconnected = () => {};
-                term.wss.close();
-                signale.complete(`TTY exited at ${port}`, code, signal);
-                extraTtys[term.port] = null;
-                term = null;
-            };
-            term.onopened = pid => {
-                signale.success(`TTY ${port} connected to frontend (process PID ${pid})`);
-            };
-            term.onresized = () => {};
-            term.ondisconnected = () => {
-                term.onclosed = () => {};
-                term.close();
-                term.wss.close();
-                extraTtys[term.port] = null;
-                term = null;
-            };
-
-            extraTtys[port] = term;
-            reply("SUCCESS: "+port);
-        }
+        extraTtys.set(tab, term);
+        term.onclosed = (code, signal) => {
+            extraTtys.delete(tab);
+            signale.complete(`TTY ${tab} exited`, code, signal);
+        };
+        term.onopened = pid => {
+            signale.success(`TTY ${tab} connected to frontend (process PID ${pid})`);
+        };
+        return id;
     });
 
     // Backend support for theme and keyboard hotswitch
@@ -741,19 +695,6 @@ app.on('ready', async () => {
     });
 });
 
-app.on('web-contents-created', (e, contents) => {
-    // Prevent creating more than one window
-    contents.on('new-window', (e, url) => {
-        e.preventDefault();
-        shell.openExternal(url);
-    });
-
-    // Prevent loading something else than the UI
-    contents.on('will-navigate', (e, url) => {
-        if (url !== contents.getURL()) e.preventDefault();
-    });
-});
-
 app.on('window-all-closed', () => {
     signale.info("All windows closed");
     clearFrontendShowFallback();
@@ -761,11 +702,6 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
-    tty.close();
-    Object.keys(extraTtys).forEach(key => {
-        if (extraTtys[key] !== null) {
-            extraTtys[key].close();
-        }
-    });
+    closeTerminals();
     signale.complete("Shutting down...");
 });

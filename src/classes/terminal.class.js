@@ -1,31 +1,18 @@
 class Terminal {
     constructor(opts) {
+        const channel = `terminal:${opts.id}`;
         if (opts.role === "client") {
             if (!opts.parentId) throw "Missing options";
 
             this.xTerm = require("xterm").Terminal;
-            const {AttachAddon} = require("xterm-addon-attach");
             const {FitAddon} = require("xterm-addon-fit");
             const {LigaturesAddon} = require("xterm-addon-ligatures");
             const {WebglAddon} = require("xterm-addon-webgl");
             this.Ipc = require("electron").ipcRenderer;
 
-            this.port = opts.port || 3000;
             this.cwd = "";
             this.isReady = false;
             this.oncwdchange = () => {};
-
-            this._sendSizeToServer = () => {
-                let cols = this.term.cols.toString();
-                let rows = this.term.rows.toString();
-                while (cols.length < 3) {
-                    cols = "0"+cols;
-                }
-                while (rows.length < 3) {
-                    rows = "0"+rows;
-                }
-                this.Ipc.send("terminal_channel-"+this.port, "Resize", cols, rows);
-            };
 
             const colorify = base => base;
 
@@ -125,57 +112,13 @@ class Terminal {
             };
             this.focus();
 
-            this.Ipc.send("terminal_channel-"+this.port, "Renderer startup");
-            this.Ipc.on("terminal_channel-"+this.port, (e, ...args) => {
-                switch(args[0]) {
-                    case "New cwd":
-                        this.cwd = args[1];
-                        this.oncwdchange(this.cwd);
-                        break;
-                    case "Fallback cwd":
-                        this.cwd = "FALLBACK |-- "+args[1];
-                        this.oncwdchange(this.cwd);
-                        break;
-                    case "New process":
-                        if (this.onprocesschange) {
-                            this.onprocesschange(args[1]);
-                        }
-                        break;
-                    default:
-                        return;
-                }
-            });
             this.resendCWD = () => {
                 this.oncwdchange(this.cwd || null);
             };
 
-            let sockHost = opts.host || "127.0.0.1";
-            let sockPort = this.port;
-
-            this.socket = new WebSocket("ws://"+sockHost+":"+sockPort);
-            this.socket.onopen = () => {
-                this.isReady = true;
-                let attachAddon = new AttachAddon(this.socket);
-                this.term.loadAddon(attachAddon);
-                this.fit();
-                this.enableHardwareAcceleration();
-                this.forceRefresh();
-                if (this.onready) {
-                    this.onready();
-                }
-            };
-            this.socket.onerror = error => {
-                console.warn(`Terminal socket error on port ${this.port}:`, error);
-            };
-            this.socket.onclose = e => {
-                this.isReady = false;
-                if (this.onclose) {
-                    this.onclose(e);
-                }
-            };
-
             this.lastSoundFX = Date.now();
-            this.socket.addEventListener("message", e => {
+            const writeOutput = data => {
+                this.term.write(data);
                 let d = Date.now();
 
                 if (d - this.lastSoundFX > 30) {
@@ -189,23 +132,25 @@ class Terminal {
 
                 // See #397
                 if (!window.settings.experimentalGlobeFeatures) return;
-                let ips = e.data.match(/((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/g);
+                let ips = data.match(/((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/g);
                 if (ips !== null && ips.length >= 1) {
                     ips = ips.filter((val, index, self) => { return self.indexOf(val) === index; });
                     ips.forEach(ip => {
                         window.mods.globe.addTemporaryConnectedMarker(ip);
                     });
                 }
-            });
+            };
 
+            const parentEvents = new AbortController();
+            const parentListener = {signal: parentEvents.signal};
             let parent = this.parent;
             parent.addEventListener("wheel", e => {
                 this.term.scrollLines(Math.round(e.deltaY/10));
-            });
+            }, parentListener);
             this._lastTouchY = null;
             parent.addEventListener("touchstart", e => {
                 this._lastTouchY = e.targetTouches[0].screenY;
-            });
+            }, parentListener);
             parent.addEventListener("touchmove", e => {
                 if (this._lastTouchY) {
                     let y = e.changedTouches[0].screenY;
@@ -213,13 +158,13 @@ class Terminal {
                     this._lastTouchY = y;
                     this.term.scrollLines(-Math.round(deltaY/10));
                 }
-            });
+            }, parentListener);
             parent.addEventListener("touchend", e => {
                 this._lastTouchY = null;
-            });
+            }, parentListener);
             parent.addEventListener("touchcancel", e => {
                 this._lastTouchY = null;
-            });
+            }, parentListener);
 
             const terminalTextarea = this.parent ? this.parent.querySelector('.xterm-helper-textarea') : null;
             if (terminalTextarea) terminalTextarea.addEventListener("keydown", e => {
@@ -227,14 +172,15 @@ class Terminal {
                     e.preventDefault();
                     window.toggleFullScreen();
                 }
-            });
+            }, parentListener);
             if (parent) {
-                parent.addEventListener("mousedown", () => this.focus());
-                parent.addEventListener("touchstart", () => this.focus(), {passive: true});
+                parent.addEventListener("mousedown", () => this.focus(), parentListener);
+                parent.addEventListener("touchstart", () => this.focus(), {...parentListener, passive: true});
             }
 
             this.forceRefresh = () => {
                 const redraw = () => {
+                    if (!this.isReady) return;
                     this.fit();
                     this.enableHardwareAcceleration();
                     if (typeof this.term.refresh === "function") {
@@ -280,16 +226,16 @@ class Terminal {
 
             this.resize = (cols, rows) => {
                 this.term.resize(cols, rows);
-                this._sendSizeToServer();
+                if (this.isReady) this.Ipc.send(channel, "Resize", cols, rows);
             };
 
-            this.write = cmd => {
-                this.socket.send(cmd);
+            this.write = data => {
+                if (this.isReady) this.Ipc.send(channel, "Input", data);
             };
 
-            this.writelr = cmd => {
-                this.socket.send(cmd+"\r");
-            };
+            this.writelr = cmd => this.write(cmd+"\r");
+            this.term.onData(this.write);
+            this.term.onBinary(data => this.write(Buffer.from(data, "latin1")));
 
             this.clipboard = {
                 copy: () => {
@@ -305,20 +251,63 @@ class Terminal {
                 didCopy: false
             };
 
+            let closed = false;
+            this.dispose = () => {
+                if (closed) return;
+                closed = true;
+                this.isReady = false;
+                this.Ipc.removeListener(channel, receive);
+                parentEvents.abort();
+                this.disableHardwareAcceleration();
+                this.term.dispose();
+            };
+            const receive = (_event, message, data) => {
+                switch (message) {
+                    case "Output":
+                        writeOutput(data);
+                        break;
+                    case "New cwd":
+                        this.cwd = data;
+                        this.oncwdchange(this.cwd);
+                        break;
+                    case "Fallback cwd":
+                        this.cwd = "FALLBACK |-- " + data;
+                        this.oncwdchange(this.cwd);
+                        break;
+                    case "New process":
+                        this.onprocesschange?.(data);
+                        break;
+                    case "Closed":
+                        this.dispose();
+                        this.onclose?.();
+                        break;
+                }
+            };
+            this.Ipc.on(channel, receive);
+            this.ready = this.Ipc.invoke("terminal:attach", opts.id).then(() => {
+                if (closed) throw new Error("Terminal has closed");
+                this.isReady = true;
+                this.forceRefresh();
+                this.Ipc.send(channel, "Resize", this.term.cols, this.term.rows);
+            });
+
         } else if (opts.role === "server") {
 
             this.Pty = require("node-pty");
-            this.Websocket = require("ws").Server;
             this.Ipc = require("electron").ipcMain;
 
             this.renderer = null;
-            this.port = opts.port || 3000;
+            this.id = opts.id;
+            const send = (message, data) => {
+                if (this.renderer && !this.renderer.isDestroyed()) {
+                    this.renderer.send(channel, message, data);
+                }
+            };
 
             this._closed = false;
             this.onclosed = () => {};
             this.onopened = () => {};
-            this.onresize = () => {};
-            this.ondisconnected = () => {};
+            this.onresized = () => {};
 
             this._disableCWDtracking = false;
             this._getTtyCWD = tty => {
@@ -375,18 +364,12 @@ class Terminal {
                     this._getTtyCWD(this.tty).then(cwd => {
                         if (this.tty._cwd === cwd) return;
                         this.tty._cwd = cwd;
-                        if (this.renderer) {
-                            this.renderer.send("terminal_channel-"+this.port, "New cwd", cwd);
-                        }
+                        send("New cwd", cwd);
                     }).catch(e => {
                         if (!this._closed) {
                             console.log("Error while tracking TTY working directory: ", e);
                             this._disableCWDtracking = true;
-                            try {
-                                this.renderer.send("terminal_channel-"+this.port, "Fallback cwd", opts.cwd || process.env.PWD);
-                            } catch(e) {
-                                // renderer closed
-                            }
+                            send("Fallback cwd", opts.cwd || process.env.PWD);
                         }
                     });
                 }
@@ -396,17 +379,11 @@ class Terminal {
                     this._getTtyProcess(this.tty).then(process => {
                         if (this.tty._process === process) return;
                         this.tty._process = process;
-                        if (this.renderer) {
-                            this.renderer.send("terminal_channel-"+this.port, "New process", process);
-                        }
+                        send("New process", process);
                     }).catch(e => {
                         if (!this._closed) {
                             console.log("Error while retrieving TTY subprocess: ", e);
-                            try {
-                                this.renderer.send("terminal_channel-"+this.port, "New process", "");
-                            } catch(e) {
-                                // renderer closed
-                            }
+                            send("New process", "");
                         }
                     });
                 }
@@ -420,69 +397,65 @@ class Terminal {
                 env: opts.env || process.env
             });
 
-            this.tty.onExit((code, signal) => {
+            let pendingOutput = "";
+            const receive = (event, message, data, rows) => {
+                if (!opts.isTrustedSender(event) || event.sender !== this.renderer) return;
+
+                if (message === "Input") {
+                    if (typeof data === "string") this.tty.write(data);
+                    else if (data instanceof Uint8Array) this.tty.write(Buffer.from(data));
+                } else if (message === "Resize" && Number.isInteger(data) && Number.isInteger(rows)
+                    && data > 0 && data <= 65535 && rows > 0 && rows <= 65535) {
+                    try {
+                        this.tty.resize(data, rows);
+                        this.onresized(data, rows);
+                    } catch {
+                        // The shell can exit while a resize is in flight.
+                    }
+                }
+            };
+            const dispose = () => {
                 this._closed = true;
-                this.onclosed(code, signal);
+                clearInterval(this._tick);
+                this.Ipc.removeListener(channel, receive);
+                this.renderer = null;
+                pendingOutput = "";
+            };
+
+            this.Ipc.on(channel, receive);
+            this.tty.onData(data => {
+                this._nextTickUpdateTtyCWD = true;
+                this._nextTickUpdateProcess = true;
+                if (this.renderer) send("Output", data);
+                else pendingOutput = (pendingOutput + data).slice(-65536);
+            });
+            this.tty.onExit(({exitCode, signal}) => {
+                if (this._closed) return;
+                send("Closed");
+                dispose();
+                this.onclosed(exitCode, signal);
             });
 
-            this.wss = new this.Websocket({
-                port: this.port,
-                clientTracking: true,
-                verifyClient: info => {
-                    if (this.wss.clients.length >= 1) {
-                        return false;
-                    } else {
-                        return true;
-                    }
+            this.attach = renderer => {
+                if (this._closed) return false;
+                this.renderer = renderer;
+                if (this._disableCWDtracking) {
+                    send("Fallback cwd", opts.cwd || process.env.PWD);
+                } else {
+                    send("New cwd", this.tty._cwd || opts.cwd || process.env.PWD);
                 }
-            });
-            this.Ipc.on("terminal_channel-"+this.port, (e, ...args) => {
-                switch(args[0]) {
-                    case "Renderer startup":
-                        this.renderer = e.sender;
-                        if (!this._disableCWDtracking && this.tty._cwd) {
-                            this.renderer.send("terminal_channel-"+this.port, "New cwd", this.tty._cwd);
-                        }
-                        if (this._disableCWDtracking) {
-                            this.renderer.send("terminal_channel-"+this.port, "Fallback cwd", opts.cwd || process.env.PWD);
-                        }
-                        break;
-                    case "Resize":
-                        let cols = args[1];
-                        let rows = args[2];
-                        try {
-                            this.tty.resize(Number(cols), Number(rows));
-                        } catch (error) {
-                            //Keep going, it'll work anyways.
-                        }
-                        this.onresized(cols, rows);
-                        break;
-                    default:
-                        return;
+                if (pendingOutput) {
+                    send("Output", pendingOutput);
+                    pendingOutput = "";
                 }
-            });
-            this.wss.on("connection", ws => {
                 this.onopened(this.tty._pid);
-                ws.on("close", (code, reason) => {
-                    this.ondisconnected(code, reason);
-                });
-                ws.on("message", msg => {
-                    this.tty.write(msg);
-                });
-                this.tty.onData(data => {
-                    this._nextTickUpdateTtyCWD = true;
-                    this._nextTickUpdateProcess = true;
-                    try {
-                        ws.send(data);
-                    } catch (e) {
-                        // Websocket closed
-                    }
-                });
-            });
+                return true;
+            };
 
             this.close = () => {
+                if (this._closed) return;
+                dispose();
                 this.tty.kill();
-                this._closed = true;
             };
         } else {
             throw "Unknown purpose";
